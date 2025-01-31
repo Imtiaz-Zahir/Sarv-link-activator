@@ -71,7 +71,7 @@ fn execute_powershell_command(command: &str) -> io::Result<()> {
 }
 
 fn prompt_exit() {
-    println!("\nPress any key to exit...");
+    println!("\nExiting...");
     let _ = std::process::Command::new("cmd")
         .args(["/C", "pause"])
         .status();
