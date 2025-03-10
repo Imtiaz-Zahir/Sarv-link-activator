@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::windows::ffi::OsStrExt;
+use std::process::{Command, Stdio};
 use std::ptr::null_mut;
 
 type HINSTANCE = *mut std::ffi::c_void;
@@ -24,20 +25,23 @@ extern "system" {
 }
 
 fn extract_token() -> io::Result<String> {
+    println!("⏳ Extracting embedded token...");
+
     let exe_path = std::env::current_exe()
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "Embedded token not found"))?;
-    
+
     let mut exe_file = File::open(&exe_path)
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "Embedded token not found"))?;
-    
+
     let mut buffer = Vec::new();
-    exe_file.read_to_end(&mut buffer)
+    exe_file
+        .read_to_end(&mut buffer)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Embedded token not found"))?;
 
     let magic = b"TOKEN_START::";
     let end_magic = b"::TOKEN_END";
 
-    buffer
+    let token = buffer
         .windows(magic.len())
         .position(|w| w == magic)
         .and_then(|start| {
@@ -48,7 +52,10 @@ fn extract_token() -> io::Result<String> {
                 .map(|end| (token_start, end))
         })
         .map(|(start, end)| String::from_utf8_lossy(&buffer[start..start + end]).into_owned())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Embedded token not found"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Embedded token not found"))?;
+
+    println!("✅ Token extracted successfully");
+    Ok(token)
 }
 
 fn os_str_to_wide(os_str: &OsStr) -> Vec<u16> {
@@ -56,40 +63,81 @@ fn os_str_to_wide(os_str: &OsStr) -> Vec<u16> {
 }
 
 fn execute_powershell_command(command: &str) -> io::Result<()> {
-    let status = std::process::Command::new("powershell")
-        .args(["-Command", command])
-        .status()?;
+    println!("⚙️ Executing command: {}", command);
 
-    if status.success() {
+    let output = Command::new("powershell")
+        .args(["-Command", command])
+        .stdout(Stdio::inherit()) // Inherit stdout so output is printed as usual
+        .stderr(Stdio::piped()) // Capture stderr separately
+        .output()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("{}", stderr);
+
+    if stderr.is_empty() || output.status.success() {
+        println!("✅ Command executed successfully");
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Command execution failed",
-        ))
+        println!("❌ Command execution failed");
+        Err(io::Error::new(io::ErrorKind::Other, stderr))
     }
 }
 
 fn prompt_exit() {
-    println!("\nExiting...");
+    println!("\nOperation completed. Press any key to exit...");
     let _ = std::process::Command::new("cmd")
         .args(["/C", "pause"])
         .status();
 }
 
-fn main() {
+fn is_winget_installed() -> io::Result<bool> {
+    let output = std::process::Command::new("winget")
+        .arg("--version")
+        .output();
+
+    match output {
+        Ok(output) => Ok(output.status.success()),
+        Err(e) => {
+            if e.kind() == io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn uninstall_cloudflared_service() -> io::Result<()> {
+    println!("⚙️ Uninstalling Cloudflared service...");
+
+    // Command to uninstall the Cloudflared service
+    let uninstall_command = "Start-Process powershell -ArgumentList '-Command', 'cloudflared.exe service uninstall' -NoNewWindow -Wait";
+
+    // Spawn a new PowerShell instance to run the uninstall command
+    let status = std::process::Command::new("powershell")
+        .args(&["-Command", uninstall_command])
+        .status()?;
+
+    if status.success() {
+        println!("✅ Cloudflared service uninstalled successfully.");
+        Ok(())
+    } else {
+        println!("❌ Failed to uninstall Cloudflared service.");
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Failed to uninstall Cloudflared service",
+        ))
+    }
+}
+
+fn main() -> io::Result<()> {
     let is_admin = unsafe { IsUserAnAdmin() } != 0;
 
     if !is_admin {
-        let exe_path = match std::env::current_exe() {
-            Ok(path) => path,
-            Err(_) => {
-                eprintln!("Error extracting token: Embedded token not found");
-                prompt_exit();
-                std::process::exit(1);
-            }
-        };
+        println!("⚠️  Administrator privileges required");
+        println!("🔼 Requesting elevation...");
 
+        let exe_path = std::env::current_exe()?;
         let exe_path_wide = os_str_to_wide(exe_path.as_os_str());
         let verb_wide = os_str_to_wide(OsStr::new("runas"));
 
@@ -105,34 +153,97 @@ fn main() {
         };
 
         if (result as usize) <= 32 {
-            eprintln!("Error extracting token: Embedded token not found");
+            println!("❌ Failed to elevate privileges");
             prompt_exit();
-            std::process::exit(1);
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to elevate privileges",
+            ));
         }
-        return;
-    }
+        Ok(())
+    } else {
+        println!("🔒 Running with administrator privileges");
 
-    let token = match extract_token() {
-        Ok(t) => t,
-        Err(_) => {
-            eprintln!("Error extracting token: Embedded token not found");
+        let token = match extract_token() {
+            Ok(t) => t,
+            Err(e) => {
+                println!("❌ Error: {}", e);
+                prompt_exit();
+                return Err(e);
+            }
+        };
+
+        println!("🔍 Checking for winget installation...");
+        if !is_winget_installed()? {
+            println!("📦 Winget not found. Installing...");
+            let install_cmd = r"
+                $ProgressPreference = 'SilentlyContinue'
+                $url = 'https://aka.ms/getwinget'
+                $output = Join-Path $env:TEMP 'Microsoft.DesktopAppInstaller.msixbundle'
+                try {
+                    Invoke-WebRequest -Uri $url -OutFile $output -UseBasicParsing
+                    Add-AppxPackage -Path $output -ErrorAction Stop
+                    Write-Host '✅ Winget installed successfully'
+                } catch {
+                    Write-Error $_
+                    exit 1
+                }
+            ";
+
+            if let Err(e) = execute_powershell_command(install_cmd) {
+                println!("❌ Failed to install winget: {}", e);
+                prompt_exit();
+                return Err(io::Error::new(io::ErrorKind::Other, e));
+            }
+        }
+
+        println!("🚀 Installing Cloudflared...");
+        let install_command = format!("winget install --id Cloudflare.cloudflared");
+        if let Err(e) = execute_powershell_command(&install_command) {
+            println!("❌ Failed to install Cloudflared: {}", e);
             prompt_exit();
-            std::process::exit(1);
+            return Err(io::Error::new(io::ErrorKind::Other, e));
         }
-    };
 
-    let command = format!(
-        "winget install --id Cloudflare.cloudflared; \
-        cloudflared.exe service uninstall; \
-        cloudflared.exe service install {}",
-        token
-    );
+        println!("⚙️ Configuring Cloudflared service...");
+        let configure_command = format!("cloudflared.exe service install {}", token);
+        match execute_powershell_command(&configure_command) {
+            Err(e) => {
+                if e.to_string().contains("service is already installed") {
+                    println!("You already have a Cloudflared service installed. To install a new service you must uninstall the previous one first.");
+                    println!("Do you want to uninstall the service? (y/n)");
+                    let mut input = String::new();
+                    io::stdin().read_line(&mut input)?;
+                    if input.trim().eq_ignore_ascii_case("y") {
+                        if let Err(e) = uninstall_cloudflared_service() {
+                            println!("❌ Failed to uninstall service: {}", e);
+                            prompt_exit();
+                            return Err(io::Error::new(io::ErrorKind::Other, e));
+                        }
 
-    if let Err(_) = execute_powershell_command(&command) {
-        eprintln!("Command execution failed");
+                        if let Err(e) = execute_powershell_command(&configure_command) {
+                            println!("❌ Failed to configure service: {}", e);
+                            prompt_exit();
+                            return Err(io::Error::new(io::ErrorKind::Other, e));
+                        }
+                    } else {
+                        println!("❌ Service uninstallation aborted by user.");
+                        prompt_exit();
+                        return Ok(());
+                    }
+                } else {
+                    println!("❌ Failed to configure service: {}", e);
+                    prompt_exit();
+                    return Err(io::Error::new(io::ErrorKind::Other, e));
+                }
+            }
+            Ok(_) => {
+                println!("✅ Cloudflared service configured successfully.");
+            }
+        }
+
+        println!("\n🎉 All operations completed successfully!");
         prompt_exit();
-        std::process::exit(1);
+        Ok(())
     }
-
-    prompt_exit();
 }
